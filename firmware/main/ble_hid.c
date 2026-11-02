@@ -19,6 +19,10 @@
 #include "hid_report.h"
 #include "cdc_ctrl.h"
 #include "keymap.h"
+#include "ble_store.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
@@ -66,7 +70,17 @@ static int s_pending_slot = -1;          /* 连接发起时的槽位 */
 
 static ble_scan_result_t s_scan_results[MAX_SCAN_RESULTS];
 static int s_scan_count = 0;
-static bool s_scanning = false;
+static volatile bool s_scanning = false;
+
+/* ===== 脱机自动重连 (瘦客户机场景) =====
+ * 已配对地址存于 NVS (ble_store). 上电后若某槽位空闲则按记录重连:
+ *   - 指数退避: 3s → 6s → 12s → ... 封顶 30s, 连接成功或用户主动断开后复位
+ *   - 扫描期间暂停重试, 避免与 scan 争用控制器
+ *   - 不依赖 CDC/PC 存在, USB 未枚举时同样运行 */
+#define RECONNECT_DELAY_MIN_MS   3000
+#define RECONNECT_DELAY_MAX_MS   30000
+static TickType_t s_reconnect_next[HID_SLOT_COUNT];
+static uint32_t   s_reconnect_delay_ms[HID_SLOT_COUNT];
 
 /* ===== 辅助函数 ===== */
 
@@ -193,10 +207,15 @@ static int gap_conn_cb(struct ble_gap_conn_desc *desc, void *arg)
         s_pending_slot = -1;
 
         s_slots[slot].conn_handle = desc->conn_handle;
+        memcpy(&s_slots[slot].peer_addr, &desc->peer_addr, sizeof(struct ble_addr));
         format_addr(&desc->peer_addr, s_slots[slot].device_addr,
                     sizeof(s_slots[slot].device_addr));
         s_slots[slot].active = true;
         s_slots[slot].discovery_state = DISC_SVCS;
+
+        /* 配对地址落 NVS: 供瘦客户机脱机重连使用 */
+        ble_store_save(slot, desc->peer_addr.a, desc->peer_addr.type);
+        s_reconnect_delay_ms[slot] = RECONNECT_DELAY_MIN_MS;  /* 成功 → 退避复位 */
 
         /* 从扫描结果中查找设备名 */
         s_slots[slot].device_name[0] = '\0';
@@ -223,6 +242,9 @@ static int gap_conn_cb(struct ble_gap_conn_desc *desc, void *arg)
             s_slots[slot].report_map_handle = 0;
             s_slots[slot].input_report_handle = 0;
             s_slots[slot].active = false;
+            /* 意外断链: 排入自动重连队列 (保留 NVS 配对记录) */
+            s_reconnect_next[slot] = xTaskGetTickCount()
+                                     + pdMS_TO_TICKS(s_reconnect_delay_ms[slot]);
             cdc_ctrl_send_disconnected(slot);
         }
     }
@@ -427,7 +449,129 @@ static struct ble_gattc_cfg s_gattc_cfg = {
     .subscribe_cb = gattc_subscribe_cb,
 };
 
+/* ===== 脱机自动重连任务 (瘦客户机场景核心) ===== */
+
+static void reconnect_task(void *arg)
+{
+    (void)arg;
+
+    /* 等待 BLE 主机同步完成 (NimBLE host sync 由 esp-idf 适配层置位) */
+    while (!ble_hs_synced()) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    /* 稍等射频就绪 */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "Reconnect task started");
+
+    /* 上电初始化: 槽位空闲且 NVS 有配对记录 → 排入重试队列 */
+    TickType_t now = xTaskGetTickCount();
+    for (int i = 0; i < HID_SLOT_COUNT; i++) {
+        uint8_t addr[6];
+        uint8_t addr_type;
+        if (s_reconnect_delay_ms[i] == 0) {
+            s_reconnect_delay_ms[i] = RECONNECT_DELAY_MIN_MS;
+        }
+        if (!s_slots[i].active && ble_store_load(i, addr, &addr_type)) {
+            s_reconnect_next[i] = now + pdMS_TO_TICKS(s_reconnect_delay_ms[i]);
+            ESP_LOGI(TAG, "Slot %d has paired device, auto-reconnect scheduled", i);
+        } else {
+            s_reconnect_next[i] = 0;
+        }
+    }
+
+    while (1) {
+        now = xTaskGetTickCount();
+
+        for (int i = 0; i < HID_SLOT_COUNT; i++) {
+            if (s_reconnect_next[i] == 0) continue;          /* 无待办 */
+            if (s_slots[i].active || s_pending_slot == i) {  /* 已连接/正在发起 */
+                s_reconnect_next[i] = 0;
+                continue;
+            }
+            if (s_scanning) continue;                        /* 扫描期间暂停 */
+            if ((long)(now - s_reconnect_next[i]) < 0) continue;
+
+            uint8_t addr[6];
+            uint8_t addr_type;
+            if (!ble_store_load(i, addr, &addr_type)) {
+                s_reconnect_next[i] = 0;                     /* 记录已被清除 */
+                continue;
+            }
+
+            char addr_str[18];
+            struct ble_addr ba = { .type = addr_type };
+            memcpy(ba.a, addr, 6);
+            format_addr(&ba, addr_str, sizeof(addr_str));
+
+            ESP_LOGI(TAG, "Slot %d: auto-reconnecting to %s (backoff=%lums)",
+                     i, addr_str, (unsigned long)s_reconnect_delay_ms[i]);
+
+            if (ble_hid_connect_internal(addr_str, i) == 0) {
+                /* 发起成功: 加倍退避以备下次失败; gap_conn_cb 成功后复位 */
+                s_reconnect_next[i] = xTaskGetTickCount()
+                                      + pdMS_TO_TICKS(s_reconnect_delay_ms[i] * 2);
+                s_reconnect_delay_ms[i] *= 2;
+                if (s_reconnect_delay_ms[i] > RECONNECT_DELAY_MAX_MS) {
+                    s_reconnect_delay_ms[i] = RECONNECT_DELAY_MAX_MS;
+                }
+            } else {
+                /* 发起失败 (如控制器忙): 短延时后按当前退避再试 */
+                s_reconnect_next[i] = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 /* ===== 公共 API ===== */
+
+/**
+ * @brief 内部连接发起 (不触碰自动重连状态, 供 reconnect_task 调用)
+ * @return 0 = 成功发起; <0 = 失败
+ */
+static int ble_hid_connect_internal(const char *addr_str, int slot)
+{
+    if (slot < 0 || slot >= HID_SLOT_COUNT) return -1;
+
+    /* 如果该槽位已连接, 先断开 */
+    if (s_slots[slot].discovery_state != DISC_IDLE) {
+        ble_hid_disconnect(slot);
+    }
+
+    if (parse_addr(addr_str, &s_slots[slot].peer_addr) != 0) {
+        ESP_LOGE(TAG, "Slot %d: Invalid address format: %s", slot, addr_str);
+        return -1;
+    }
+
+    format_addr(&s_slots[slot].peer_addr, s_slots[slot].device_addr,
+                sizeof(s_slots[slot].device_addr));
+
+    /* 从扫描结果中查找设备名 */
+    s_slots[slot].device_name[0] = '\0';
+    for (int i = 0; i < s_scan_count; i++) {
+        if (strcmp(s_scan_results[i].addr_str, s_slots[slot].device_addr) == 0) {
+            strncpy(s_slots[slot].device_name, s_scan_results[i].name,
+                    sizeof(s_slots[slot].device_name) - 1);
+            break;
+        }
+    }
+
+    /* 设置 pending 槽位, 连接建立后由 gap_conn_cb 分配 */
+    s_pending_slot = slot;
+
+    int rc = ble_gap_conn(BLE_GAP_OWN_ADDR_PUBLIC, BLE_GAP_CONN_F_INIT,
+                          &s_slots[slot].peer_addr);
+    if (rc != 0) {
+        s_pending_slot = -1;
+        ESP_LOGE(TAG, "Slot %d: Connection start failed: rc=%d", slot, rc);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Slot %d: Connecting to %s", slot, s_slots[slot].device_addr);
+    return 0;
+}
 
 void ble_hid_init(void)
 {
@@ -442,12 +586,19 @@ void ble_hid_init(void)
         s_slots[i].conn_handle = 0;
         s_slots[i].discovery_state = DISC_IDLE;
         s_slots[i].active = false;
+        s_reconnect_next[i] = 0;
+        s_reconnect_delay_ms[i] = RECONNECT_DELAY_MIN_MS;
     }
 
     memset(s_scan_results, 0, sizeof(s_scan_results));
     s_scan_count = 0;
     s_scanning = false;
     s_pending_slot = -1;
+
+    ble_store_init();
+
+    /* 脱机自动重连任务: 不依赖 PC/CDC, 瘦客户机上电即用 */
+    xTaskCreate(reconnect_task, "ble_reconn", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "BLE HID dual-slot module initialized");
 }
@@ -494,49 +645,31 @@ int ble_hid_connect(const char *addr_str, int slot)
         return -1;
     }
 
-    /* 如果该槽位已连接, 先断开 */
-    if (s_slots[slot].discovery_state != DISC_IDLE) {
-        ble_hid_disconnect(slot);
-    }
+    /* 用户主动发起连接 → 取消该槽位的自动重连排队 */
+    s_reconnect_next[slot] = 0;
+    s_reconnect_delay_ms[slot] = RECONNECT_DELAY_MIN_MS;
 
-    if (parse_addr(addr_str, &s_slots[slot].peer_addr) != 0) {
-        ESP_LOGE(TAG, "Slot %d: Invalid address format: %s", slot, addr_str);
-        cdc_ctrl_send_error(slot, "Invalid address format");
-        return -1;
-    }
-
-    format_addr(&s_slots[slot].peer_addr, s_slots[slot].device_addr,
-                sizeof(s_slots[slot].device_addr));
-
-    /* 从扫描结果中查找设备名 */
-    s_slots[slot].device_name[0] = '\0';
-    for (int i = 0; i < s_scan_count; i++) {
-        if (strcmp(s_scan_results[i].addr_str, s_slots[slot].device_addr) == 0) {
-            strncpy(s_slots[slot].device_name, s_scan_results[i].name,
-                    sizeof(s_slots[slot].device_name) - 1);
-            break;
+    int rc = ble_hid_connect_internal(addr_str, slot);
+    if (rc != 0) {
+        /* 复用内部错误日志点, 向 PC 上报具体失败原因 */
+        if (s_slots[slot].device_addr[0] == '\0') {
+            cdc_ctrl_send_error(slot, "Invalid address format");
+        } else {
+            cdc_ctrl_send_error(slot, "Connection start failed");
         }
     }
-
-    /* 设置 pending 槽位, 连接建立后由 gap_conn_cb 分配 */
-    s_pending_slot = slot;
-
-    int rc = ble_gap_conn(BLE_GAP_OWN_ADDR_PUBLIC, BLE_GAP_CONN_F_INIT,
-                          &s_slots[slot].peer_addr);
-    if (rc != 0) {
-        s_pending_slot = -1;
-        ESP_LOGE(TAG, "Slot %d: Connection start failed: rc=%d", slot, rc);
-        cdc_ctrl_send_error(slot, "Connection start failed");
-        return -1;
-    }
-
-    ESP_LOGI(TAG, "Slot %d: Connecting to %s", slot, s_slots[slot].device_addr);
-    return 0;
+    return rc;
 }
 
 void ble_hid_disconnect(int slot)
 {
     if (slot < 0 || slot >= HID_SLOT_COUNT) return;
+
+    /* 用户主动断开 → 清除 NVS 配对记录并停止自动重连 */
+    s_reconnect_next[slot] = 0;
+    s_reconnect_delay_ms[slot] = RECONNECT_DELAY_MIN_MS;
+    ble_store_clear(slot);
+
     if (!s_slots[slot].active) return;
 
     if (s_slots[slot].conn_handle != 0) {

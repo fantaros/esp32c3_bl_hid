@@ -13,6 +13,14 @@
  *            {"type":"keymap_ack","version":N,"applied":{"remaps":n,"macros":m},"dropped":n}
  *   version 语义: 固件仅在自身版本变化时递增; PC 推送时若带 "force":true 或
  *   其 version >= 固件 version 则接受 (last-write-wins), 否则回 error.
+ *
+ * NVS blob 布局 (v2, 小端):
+ *   header: magic(2) fmt_ver(2) version(4) remap_count(1) macro_count(1) paired_valid(1) reserved(1) paired[12]
+ *           paired = {kb_addr_type(1) kb_wire[6] ms_addr_type(1) ms_wire[6]}
+ *   remap : slot(1) from(1) to(1)
+ *   macro : name[24] trig_slot(1) trig_usage(1) step_count(1)
+ *           steps: keys[6] key_count(1) down(1) delay_ms(2)
+ *   v1 blob (无 paired 字段) 加载后按旧格式解析, 保存时自动升级为 v2.
  */
 #include "keymap.h"
 #include "usb_device.h"
@@ -23,6 +31,11 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+
+#ifndef KEYMAP_HOST_TEST
+#include "ble_store.h"
+#include "ble_hid.h"
+#endif
 
 #include <string.h>
 #include <stdlib.h>
@@ -45,10 +58,15 @@ typedef struct __attribute__((packed)) {
     uint32_t version;
     uint8_t  remap_count;
     uint8_t  macro_count;
+    uint8_t  paired_valid;   /* v2+: 配对快照是否有效 */
+    uint8_t  reserved;
+    uint8_t  paired[12];     /* v2+: {kb_type, kb_wire[6], ms_type, ms_wire[6]} */
 } keymap_blob_hdr_t;
 
-#define KEYMAP_MAGIC   0x4B4D   /* 'KM' */
-#define KEYMAP_FMT_VER 1
+#define KEYMAP_MAGIC       0x4B4D   /* 'KM' */
+#define KEYMAP_FMT_VER     2        /* 当前写出版本 (含配对快照) */
+#define KEYMAP_FMT_VER_MIN 1        /* 可读的最低版本 (v1 无 paired 字段) */
+#define KEYMAP_PAIRED_LEN  12
 
 /* ===== 内存状态 ===== */
 static keymap_remap_t s_remaps[KEYMAP_MAX_REMAPS];
@@ -68,13 +86,47 @@ static esp_timer_handle_t s_timer = NULL;
 
 static void keymap_save(void);
 
+/* ===== 配对快照桥接 (ble_store <-> NVS blob <-> CDC JSON) =====
+ * paired[12] = {kb_addr_type(1), kb_wire(6), ms_addr_type(1), ms_wire(6)}
+ * wire 顺序与 NimBLE ble_addr.a 一致, 两端仅做搬运, 不解析字节序. */
+
+static bool keymap_fill_paired_snapshot(uint8_t *paired)
+{
+#ifdef KEYMAP_HOST_TEST
+    extern int keymap_host_test_store_load(int slot, uint8_t *addr, uint8_t *addr_type);
+    int a = keymap_host_test_store_load(KEYMAP_SLOT_KEYBOARD, paired + 1, paired);
+    int b = keymap_host_test_store_load(KEYMAP_SLOT_MOUSE, paired + 8, paired + 7);
+    return (a > 0 || b > 0);
+#else
+    uint8_t addr[6], atype;
+    bool kb = ble_store_load(HID_SLOT_KEYBOARD, addr, &atype);
+    if (kb) { paired[0] = atype; memcpy(paired + 1, addr, 6); }
+    bool ms = ble_store_load(HID_SLOT_MOUSE, addr, &atype);
+    if (ms) { paired[7] = atype; memcpy(paired + 8, addr, 6); }
+    return kb || ms;
+#endif
+}
+
+static void keymap_restore_paired_snapshot(const uint8_t *paired)
+{
+#ifdef KEYMAP_HOST_TEST
+    extern void keymap_host_test_store_save(int slot, const uint8_t *addr, uint8_t addr_type);
+    if (paired[0] != 0) keymap_host_test_store_save(KEYMAP_SLOT_KEYBOARD, paired + 1, paired[0]);
+    if (paired[7] != 0) keymap_host_test_store_save(KEYMAP_SLOT_MOUSE, paired + 8, paired[7]);
+#else
+    if (paired[0] != 0)
+        ble_store_save(HID_SLOT_KEYBOARD, paired + 1, paired[0]);
+    if (paired[7] != 0)
+        ble_store_save(HID_SLOT_MOUSE, paired + 8, paired[7]);
+#endif
+}
+
 /* ===== NVS 持久化 ===== */
 
 static void keymap_save(void)
 {
     size_t blob_len = sizeof(keymap_blob_hdr_t)
-                    + s_remap_count * 3
-                    + 0;
+                    + s_remap_count * 3;
     /* 计算 macro 部分长度 */
     for (int i = 0; i < KEYMAP_MAX_MACROS; i++) {
         if (s_macros[i].used) {
@@ -96,6 +148,12 @@ static void keymap_save(void)
     hdr->fmt_ver = KEYMAP_FMT_VER;
     hdr->version = s_version;
     hdr->remap_count = (uint8_t)s_remap_count;
+    /* 配对快照: 从 ble_store 读取当前槽位地址 (v1 兼容时 hdr->paired_valid=0) */
+    if (keymap_fill_paired_snapshot(hdr->paired)) {
+        hdr->paired_valid = 1;
+    } else {
+        hdr->paired_valid = 0;
+    }
     uint8_t mc = 0;
     for (int i = 0; i < KEYMAP_MAX_MACROS; i++) if (s_macros[i].used) mc++;
     hdr->macro_count = mc;
@@ -152,13 +210,23 @@ static void keymap_load(void)
     nvs_close(h);
 
     keymap_blob_hdr_t *hdr = (keymap_blob_hdr_t *)blob;
-    if (hdr->magic != KEYMAP_MAGIC || hdr->fmt_ver != KEYMAP_FMT_VER) {
-        ESP_LOGW(TAG, "Keymap blob invalid, ignoring");
+    if (hdr->magic != KEYMAP_MAGIC ||
+        hdr->fmt_ver < KEYMAP_FMT_VER_MIN || hdr->fmt_ver > KEYMAP_FMT_VER) {
+        ESP_LOGW(TAG, "Keymap blob invalid (fmt=%u), ignoring", hdr->fmt_ver);
         free(blob); return;
     }
 
+    /* v1 blob 头部比 v2 小 (无 paired_valid/reserved/paired): 按实际长度取数据区起点 */
+    size_t hdr_used = (hdr->fmt_ver >= 2) ? sizeof(keymap_blob_hdr_t) : 10;
+    if (len < hdr_used) { free(blob); return; }
+
+    /* 恢复配对快照 → 写入 ble_store (供 BLE 模块初始化时自动重连) */
+    if (hdr->fmt_ver >= 2 && hdr->paired_valid == 1) {
+        keymap_restore_paired_snapshot(hdr->paired);
+    }
+
     s_version = hdr->version;
-    size_t off = sizeof(keymap_blob_hdr_t);
+    size_t off = hdr_used;
 
     s_remap_count = (hdr->remap_count <= KEYMAP_MAX_REMAPS) ? hdr->remap_count : KEYMAP_MAX_REMAPS;
     for (int i = 0; i < s_remap_count; i++) {
@@ -493,6 +561,26 @@ cJSON *keymap_build_state_json(void)
     cJSON_AddNumberToObject(root, "max_remaps", KEYMAP_MAX_REMAPS);
     cJSON_AddNumberToObject(root, "max_macros", KEYMAP_MAX_MACROS);
 
+    /* 配对快照 (供 PC 端 JSON 备份/迁移): {"keyboard":"AA:..","mouse":"AA:.."} */
+    uint8_t paired[KEYMAP_PAIRED_LEN];
+    memset(paired, 0, sizeof(paired));
+    if (keymap_fill_paired_snapshot(paired)) {
+        cJSON *jpair = cJSON_CreateObject();
+        if (paired[0] != 0) {
+            char a18[18];
+            snprintf(a18, sizeof(a18), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     paired[6], paired[5], paired[4], paired[3], paired[2], paired[1]);
+            cJSON_AddStringToObject(jpair, "keyboard", a18);
+        }
+        if (paired[7] != 0) {
+            char a18[18];
+            snprintf(a18, sizeof(a18), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     paired[13], paired[12], paired[11], paired[10], paired[9], paired[8]);
+            cJSON_AddStringToObject(jpair, "mouse", a18);
+        }
+        cJSON_AddItemToObject(root, "paired", jpair);
+    }
+
     cJSON *entries = cJSON_CreateArray();
 
     for (int i = 0; i < s_remap_count; i++) {
@@ -551,6 +639,29 @@ int keymap_apply_set_json(const cJSON *root, int *applied_remaps, int *applied_m
         if (applied_macros) *applied_macros = 0;
         if (dropped_out) *dropped_out = 0;
         return -1;
+    }
+
+    /* 可选 paired 快照: {"keyboard":"AA:BB:CC:DD:EE:FF","mouse":"..."} → 写入 ble_store */
+    const cJSON *jpaired = cJSON_GetObjectItem(root, "paired");
+    if (jpaired && cJSON_IsObject(jpaired)) {
+        uint8_t paired[KEYMAP_PAIRED_LEN];
+        memset(paired, 0, sizeof(paired));
+        bool any = false;
+        const cJSON *jk = cJSON_GetObjectItem(jpaired, "keyboard");
+        const cJSON *jm = cJSON_GetObjectItem(jpaired, "mouse");
+        struct { const cJSON *j; int off; } ps[2] = {{jk, 0}, {jm, 7}};
+        for (int i = 0; i < 2; i++) {
+            if (!ps[i].j || !cJSON_IsString(ps[i].j)) continue;
+            unsigned b[6];
+            if (sscanf(ps[i].j->valuestring, "%2x:%2x:%2x:%2x:%2x:%2x",
+                       &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+                int o = ps[i].off;
+                paired[o] = 0;   /* addr_type: public */
+                for (int k = 0; k < 6; k++) paired[o + 1 + k] = (uint8_t)b[5 - k]; /* wire order */
+                any = true;
+            }
+        }
+        if (any) keymap_restore_paired_snapshot(paired);
     }
 
     /* 全量替换语义: 先清空再逐条应用 */
