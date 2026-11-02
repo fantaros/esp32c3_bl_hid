@@ -20,6 +20,7 @@ ESP32-C3 BLE HID Bridge - PC Control Application
   scan              开始扫描 BLE HID 设备
   stop              停止扫描
   connect <type> <addr>  连接设备 (type: keyboard/mouse)
+  connect both <kb>+<ms> 同时连接键盘与鼠标两个设备
   disconnect [type] 断开连接
   status            查询当前状态
   keymap            显示本地键位映射/宏配置 (含版本)
@@ -185,6 +186,7 @@ def interactive_mode(ser):
     print("  scan                Start BLE HID scan")
     print("  stop                Stop scan")
     print("  connect <type> <addr>  Connect (type: keyboard/mouse)")
+    print("  connect both <kb>+<ms> Connect keyboard & mouse devices together")
     print("  disconnect [type]    Disconnect (type: keyboard/mouse, or both)")
     print("  status              Show current status")
     print("  quit                Exit")
@@ -252,12 +254,19 @@ def interactive_mode(ser):
                     print("  Usage: remap <keyboard|mouse> <from_hex> <to_hex>")
             elif cmd.startswith("connect "):
                 parts = cmd[8:].strip().split()
-                if len(parts) >= 2:
+                if len(parts) == 2 and parts[0] == "both":
+                    # 多设备: 依次连接键盘槽和鼠标槽 (同一设备不允许占两个槽)
+                    kb_addr, ms_addr = parts[1].split("+")
+                    send_cmd(ser, {"cmd": "connect", "addr": kb_addr, "type": "keyboard"})
+                    time.sleep(1.5)
+                    send_cmd(ser, {"cmd": "connect", "addr": ms_addr, "type": "mouse"})
+                elif len(parts) >= 2:
                     dev_type = parts[0]
                     addr = parts[1]
                     send_cmd(ser, {"cmd": "connect", "addr": addr, "type": dev_type})
                 else:
                     print("  Usage: connect <keyboard|mouse> <addr>")
+                    print("         connect both <kb_addr>+<ms_addr>")
             else:
                 print(f"  Unknown command: {cmd}")
         except KeyboardInterrupt:

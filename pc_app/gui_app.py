@@ -521,10 +521,25 @@ class ESP32C3HIDGUI:
     def _on_refresh(self):
         self._send_cmd({"cmd": "status"})
 
+    def _check_slot_conflict(self, addr, slot):
+        """多设备约束: 同一设备不允许同时占用键盘/鼠标两个槽位"""
+        other = "mouse" if slot == "keyboard" else "keyboard"
+        # 直接检查该地址是否已绑定在另一个槽位
+        dev = self.devices.get(addr)
+        if dev and dev.get("connected") and dev.get("slot") == other:
+            messagebox.showwarning(
+                "设备冲突",
+                f"该设备已连接到「{other}」槽位。\n"
+                f"同一设备不能同时作为键盘和鼠标使用，请先将其断开。")
+            return False
+        return True
+
     def _on_connect_kb(self):
         addr = self._get_combo_addr(self.kb_combo)
         if not addr:
             messagebox.showinfo("提示", "请先选择一个键盘设备")
+            return
+        if not self._check_slot_conflict(addr, "keyboard"):
             return
         self._log(f"正在连接键盘: {addr}")
         self._send_cmd({"cmd": "connect", "addr": addr, "type": "keyboard"})
@@ -538,6 +553,8 @@ class ESP32C3HIDGUI:
         addr = self._get_combo_addr(self.ms_combo)
         if not addr:
             messagebox.showinfo("提示", "请先选择一个鼠标设备")
+            return
+        if not self._check_slot_conflict(addr, "mouse"):
             return
         self._log(f"正在连接鼠标: {addr}")
         self._send_cmd({"cmd": "connect", "addr": addr, "type": "mouse"})

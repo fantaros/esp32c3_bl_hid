@@ -3,6 +3,7 @@ idf_component_register(SRCS
     "usb_device.c"
     "hid_report.c"
     "ble_hid.c"
+    "ble_store.c"
     "cdc_ctrl.c"
     "keymap.c"
     INCLUDE_DIRS "include"

@@ -535,9 +535,35 @@ static int ble_hid_connect_internal(const char *addr_str, int slot)
 {
     if (slot < 0 || slot >= HID_SLOT_COUNT) return -1;
 
-    /* 如果该槽位已连接, 先断开 */
-    if (s_slots[slot].discovery_state != DISC_IDLE) {
-        ble_hid_disconnect(slot);
+    /* 多设备连接约束检查:
+     *   a) 同一设备地址不允许占用两个槽位 (避免重复转发/输入冲突)
+     *   b) 若目标槽位已有"不同设备"在连接, 自动替换; 同地址重连保持原行为
+     * 注: 系统始终最多维持 1 键盘 + 1 鼠标, USB 侧只有这两个 HID 报告通道,
+     *     因此"同一时间只有一个键盘和一个鼠标能对已连接 PC 输出输入"。 */
+    struct ble_addr new_addr;
+    bool have_new_addr = (parse_addr(addr_str, &new_addr) == 0);
+
+    if (have_new_addr) {
+        for (int i = 0; i < HID_SLOT_COUNT; i++) {
+            if (i == slot) continue;
+            if ((s_slots[i].active || s_pending_slot == i) &&
+                s_slots[i].peer_addr.type == new_addr.type &&
+                memcmp(s_slots[i].peer_addr.a, new_addr.a, 6) == 0) {
+                ESP_LOGW(TAG, "Slot %d: device %s already bound to slot %d, connect rejected",
+                         slot, addr_str, i);
+                return -2;
+            }
+        }
+    }
+
+    /* 如果该槽位已连接其他设备, 先断开并清除其 NVS 配对记录 */
+    if (s_slots[slot].active || s_slots[slot].discovery_state != DISC_IDLE) {
+        bool same_dev = have_new_addr &&
+                        s_slots[slot].peer_addr.type == new_addr.type &&
+                        memcmp(s_slots[slot].peer_addr.a, new_addr.a, 6) == 0;
+        if (!same_dev) {
+            ble_hid_disconnect(slot);
+        }
     }
 
     if (parse_addr(addr_str, &s_slots[slot].peer_addr) != 0) {
@@ -652,7 +678,9 @@ int ble_hid_connect(const char *addr_str, int slot)
     int rc = ble_hid_connect_internal(addr_str, slot);
     if (rc != 0) {
         /* 复用内部错误日志点, 向 PC 上报具体失败原因 */
-        if (s_slots[slot].device_addr[0] == '\0') {
+        if (rc == -2) {
+            cdc_ctrl_send_error(slot, "Device already connected to the other slot");
+        } else if (s_slots[slot].device_addr[0] == '\0') {
             cdc_ctrl_send_error(slot, "Invalid address format");
         } else {
             cdc_ctrl_send_error(slot, "Connection start failed");
