@@ -18,6 +18,7 @@
 #include "usb_device.h"
 #include "hid_report.h"
 #include "cdc_ctrl.h"
+#include "keymap.h"
 
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
@@ -395,13 +396,13 @@ static int gattc_notify_cb(uint16_t conn_handle, uint16_t chr_handle,
         return 0;
     }
 
-    /* 根据槽位类型转发到对应的USB HID */
+    /* 键位映射/宏引擎: USB 发送前的统一注入点 (可能吞掉或改写报告) */
     if (slot == HID_SLOT_KEYBOARD) {
-        if (out_type == 1) {
+        if (out_type == 1 && keymap_apply_keyboard(slot, usb_kb)) {
             usb_hid_send_keyboard(usb_kb[0], usb_kb[1], usb_kb + 2);
         }
     } else if (slot == HID_SLOT_MOUSE) {
-        if (out_type == 2) {
+        if (out_type == 2 && keymap_apply_mouse(slot, usb_mouse)) {
             usb_hid_send_mouse(usb_mouse[0], (int8_t)usb_mouse[1],
                                (int8_t)usb_mouse[2], (int8_t)usb_mouse[3]);
         }

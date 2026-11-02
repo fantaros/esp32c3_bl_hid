@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+struct cJSON;
+
 /**
  * @brief CDC 控制协议模块初始化
  */
@@ -32,3 +34,9 @@ void cdc_ctrl_send_connected(int slot, const char *device_name,
 void cdc_ctrl_send_disconnected(int slot);
 void cdc_ctrl_send_error(int slot, const char *message);
 void cdc_ctrl_send_info(const char *message);
+
+/**
+ * @brief 发送一条已构造好的 JSON 消息 (自动序列化 + 换行)
+ * @param root cJSON 对象, 所有权由本函数接管 (内部 cJSON_Delete)
+ */
+void cdc_ctrl_send_json(struct cJSON *root);
