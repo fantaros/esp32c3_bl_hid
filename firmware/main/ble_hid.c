@@ -227,8 +227,20 @@ static int gap_conn_cb(struct ble_gap_conn_desc *desc, void *arg)
             }
         }
 
-        ESP_LOGI(TAG, "Slot %d connected: %s (handle=%d)",
-                 slot, s_slots[slot].device_addr, desc->conn_handle);
+        /* GAP 连接描述符携带的对端名称 (广播/应答中的完整名称) 作为兜底 */
+        if (s_slots[slot].device_name[0] == '\0' && desc->peer_name_len > 0) {
+            size_t n = desc->peer_name_len;
+            if (n >= sizeof(s_slots[slot].device_name)) {
+                n = sizeof(s_slots[slot].device_name) - 1;
+            }
+            memcpy(s_slots[slot].device_name, desc->peer_name, n);
+            s_slots[slot].device_name[n] = '\0';
+        }
+
+        ESP_LOGI(TAG, "Slot %d connected: %s name='%s' (handle=%d)",
+                 slot, s_slots[slot].device_addr,
+                 s_slots[slot].device_name[0] ? s_slots[slot].device_name : "(unknown)",
+                 desc->conn_handle);
 
         /* 开始服务发现 */
         ble_gattc_disc_all_svcs(desc->conn_handle, 1, 0xFFFF);

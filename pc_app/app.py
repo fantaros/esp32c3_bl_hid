@@ -11,7 +11,7 @@ ESP32-C3 BLE HID Bridge - PC Control Application
 用法:
   python app.py                          # 自动检测串口, 进入交互模式
   python app.py --port COM3              # 指定串口, 进入交互模式
-  python app.py --scan                   # 执行一次扫描 (10秒) 并退出
+  python app.py --scan                   # 执行一次扫描 (10秒), 结束后打印设备表格(名称+MAC)并退出
   python app.py --connect AA:BB:CC:DD:EE:FF  # 连接到指定设备并退出
   python app.py --status                 # 查询一次状态并退出
   python app.py --list                   # 列出所有可用串口
@@ -33,9 +33,11 @@ ESP32-C3 BLE HID Bridge - PC Control Application
 注意:
   - USB HID 键鼠输入由 PC 系统直接消费, 无需本应用参与
   - 本应用仅负责通过 CDC 串口配置 ESP32-C3 的 BLE 连接
+  - --list 同时列出可用串口和已配对的蓝牙设备 (名称 + MAC 地址)
 """
 
 import json
+import os
 import sys
 import time
 import threading
@@ -53,6 +55,12 @@ except ImportError:
 VID = 0x303A
 PID = 0x400B
 BAUD = 115200
+
+# 扫描结果缓存: addr -> {"name", "rssi", "appearance", "type"}
+scan_cache = {}
+
+# 已连接设备缓存: addr -> slot ("keyboard"/"mouse"), 由 connected/status 消息维护
+connected_cache = {}
 
 
 def find_port():
@@ -76,6 +84,127 @@ def list_ports():
         print(f"  {p.device:12s} (VID={vid_str} PID={pid_str}){marker}")
 
 
+def _load_bindings():
+    """读取本地持久化的已配对设备记录 (addr -> name), 由 connected 消息写入"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_devices.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_binding(addr, name):
+    """connected 消息到达时落盘设备名与 MAC 的对应关系"""
+    if not addr:
+        return
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_devices.json")
+    known = _load_bindings()
+    if name and known.get(addr) != name:
+        known[addr] = name
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(known, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+def list_devices(ser=None, scan_seconds=0):
+    """列出蓝牙设备: 名称 + MAC 地址 (+ 连接状态)。
+
+    数据来源三层合并:
+      1. 固件 status 查询 → 当前键盘/鼠标槽位的已连接设备 (名称+MAC)
+      2. known_devices.json → 历史配对过的设备 (名称+MAC)
+      3. 可选一次 BLE 扫描 → 周围广播中的 HID 设备 (名称+MAC+RSSI)
+    """
+    known = _load_bindings()          # addr -> name
+
+    def collect(msg):
+        mtype = msg.get("type", "")
+        if mtype == "scan_result":
+            addr = msg.get("addr", "")
+            if addr:
+                scan_cache[addr] = {
+                    "name": msg.get("name", ""),
+                    "rssi": msg.get("rssi", 0),
+                    "appearance": msg.get("appearance", 0),
+                    "type": msg.get("device_type", 0),
+                }
+        elif mtype == "connected":
+            addr = msg.get("addr", "")
+            if addr:
+                slot = str(msg.get("device_type", "")).replace("connected_", "") or "unknown"
+                connected_cache[addr] = slot
+        elif mtype == "disconnected":
+            addr = msg.get("addr", "")
+            if addr:
+                connected_cache.pop(addr, None)
+        elif mtype == "status":
+            for slot_key in ("keyboard", "mouse"):
+                s = msg.get(slot_key) or {}
+                if s.get("connected"):
+                    addr = s.get("addr", "")
+                    name = s.get("device", "")
+                    if addr:
+                        connected_cache[addr] = slot_key
+                        if name and name != "(no name)":
+                            known.setdefault(addr, name)
+                else:
+                    for a, sl in list(connected_cache.items()):
+                        if sl == slot_key:
+                            connected_cache.pop(a, None)
+
+    global handle_msg
+    if ser is not None:
+        # 临时挂钩: 扫描期间收到的 scan_result 也进入缓存
+        orig_handle = handle_msg
+
+        def hooked(msg):
+            collect(msg)
+            orig_handle(msg)
+
+        handle_msg = hooked
+        try:
+            send_cmd(ser, {"cmd": "status"})
+            time.sleep(1.0)
+            if scan_seconds > 0:
+                print(f"  Scanning BLE devices ({scan_seconds}s)...")
+                send_cmd(ser, {"cmd": "scan"})
+                time.sleep(scan_seconds)
+                send_cmd(ser, {"cmd": "scan_stop"})
+                time.sleep(1.0)
+        finally:
+            handle_msg = orig_handle
+
+    # 合并三层数据: addr -> (name, extra)
+    rows = {}
+    for addr, info in scan_cache.items():
+        rows[addr] = (info.get("name") or known.get(addr, ""),
+                      f"RSSI={info.get('rssi', 0)}dBm")
+    for addr, name in known.items():
+        if addr not in rows:
+            rows[addr] = (name, "paired")
+    for addr, slot in connected_cache.items():
+        name = rows.get(addr, ("", ""))[0] or known.get(addr, "")
+        rows[addr] = (name, f"CONNECTED [{slot}]")
+
+    if not rows:
+        print("  No Bluetooth devices known yet.")
+        print("  Tip: run 'python app.py --scan' first, or use interactive 'scan'.")
+        return
+
+    print("\n  Bluetooth devices (name / MAC address):")
+    print(f"  {'NAME':24s} {'MAC ADDRESS':18s} INFO")
+    print(f"  {'-' * 24} {'-' * 18} {'-' * 24}")
+    for addr, (name, extra) in sorted(rows.items(),
+                                      key=lambda kv: (kv[1][1].startswith("CONNECTED") is False,
+                                                      kv[0])):
+        display = name if name else "(no name)"
+        print(f"  {display:24s} {addr:18s} {extra}")
+    print()
+
+
 def send_cmd(ser, cmd_dict):
     """发送 JSON 指令"""
     msg = json.dumps(cmd_dict)
@@ -87,6 +216,34 @@ keymap_store = None
 keymap_client = None
 
 
+def print_scan_table():
+    """打印扫描到的蓝牙设备表格: 名称 + MAC 地址 (+ RSSI / 状态)"""
+    known = _load_bindings()
+    rows = {}
+    for addr, info in scan_cache.items():
+        raw_name = (info.get("name") or "").strip()
+        name = raw_name or known.get(addr, "")
+        rows[addr] = (name, f"RSSI={info.get('rssi', 0)}dBm")
+    for addr, name in known.items():
+        if addr not in rows:
+            rows[addr] = (name, "paired")
+    for addr, slot in connected_cache.items():
+        name = rows.get(addr, ("", ""))[0] or known.get(addr, "")
+        rows[addr] = (name, f"CONNECTED [{slot}]")
+
+    if not rows:
+        print("\n  No BLE HID devices found during scan.")
+        return
+
+    print(f"\n  Scan results - Bluetooth devices (name / MAC address): {len(rows)} found")
+    print(f"  {'NAME':24s} {'MAC ADDRESS':18s} INFO")
+    print(f"  {'-' * 24} {'-' * 18} {'-' * 24}")
+    for addr, (name, extra) in sorted(rows.items(), key=lambda kv: kv[0]):
+        display = name if name else "(no name)"
+        print(f"  {display:24s} {addr:18s} {extra}")
+    print()
+
+
 def handle_msg(msg):
     """处理收到的 JSON 消息"""
     msg_type = msg.get("type", "")
@@ -96,10 +253,15 @@ def handle_msg(msg):
         return
 
     if msg_type == "scan_result":
-        name = msg.get("name", "Unknown")
+        name = msg.get("name", "") or ""
         addr = msg.get("addr", "")
         rssi = msg.get("rssi", 0)
-        print(f"  [HID] {name:20s} ({addr}) RSSI={rssi}dBm")
+        # 无名设备用本地 known_devices 记录兜底显示真实名称
+        display_name = name.strip() or (_load_bindings().get(addr, "") or "(no name)")
+        scan_cache[addr] = {"name": name, "rssi": rssi,
+                            "appearance": msg.get("appearance", 0),
+                            "type": msg.get("device_type", 0)}
+        print(f"  [HID] {display_name:20s} ({addr}) RSSI={rssi}dBm")
 
     elif msg_type == "scan_complete":
         print("  [Scan complete]")
@@ -108,20 +270,37 @@ def handle_msg(msg):
         device = msg.get("device", "Unknown")
         addr = msg.get("addr", "")
         dtype = msg.get("device_type", "unknown")
+        _save_binding(addr, "" if device == "Unknown" else device)
+        slot = str(dtype).replace("connected_", "") or "unknown"
+        if addr:
+            connected_cache[addr] = slot
         print(f"  [Connected] {device} ({addr}) type={dtype}")
         print("  [Ready] BLE HID input is now forwarded to PC via USB.")
 
     elif msg_type == "disconnected":
+        addr = msg.get("addr", "")
+        if addr:
+            connected_cache.pop(addr, None)
         print("  [Disconnected]")
 
     elif msg_type == "status":
         scanning = msg.get("scanning", False)
-        connected = msg.get("connected", False)
-        device = msg.get("device", "")
-        addr = msg.get("addr", "")
-        dtype = msg.get("device_type", "unknown")
-        print(f"  [Status] scanning={scanning} connected={connected} "
-              f"device={device} type={dtype}")
+        print(f"  [Status] scanning={scanning}")
+        for slot_key in ("keyboard", "mouse"):
+            s = msg.get(slot_key) or {}
+            if s.get("connected"):
+                name = s.get("device", "(no name)")
+                addr = s.get("addr", "")
+                _save_binding(addr, name if name != "(no name)" else "")
+                if addr:
+                    connected_cache[addr] = slot_key
+                print(f"    {slot_key:8s}: CONNECTED  {name} ({addr})")
+            else:
+                # 清除该槽位残留的连接记录
+                for a, sl in list(connected_cache.items()):
+                    if sl == slot_key:
+                        connected_cache.pop(a, None)
+                print(f"    {slot_key:8s}: idle")
 
     elif msg_type == "keymap_state":
         entries = msg.get("entries", [])
@@ -189,6 +368,8 @@ def interactive_mode(ser):
     print("  connect both <kb>+<ms> Connect keyboard & mouse devices together")
     print("  disconnect [type]    Disconnect (type: keyboard/mouse, or both)")
     print("  status              Show current status")
+    print("  list                List BLE devices (name + MAC address)")
+    print("  list scan [sec]     Scan then list BLE devices (name + MAC address)")
     print("  quit                Exit")
     print()
 
@@ -205,6 +386,9 @@ def interactive_mode(ser):
                 send_cmd(ser, {"cmd": "scan"})
             elif cmd == "stop":
                 send_cmd(ser, {"cmd": "scan_stop"})
+                time.sleep(0.5)
+                # 停止扫描后打印设备表格: 名称 + MAC 地址
+                print_scan_table()
             elif cmd == "disconnect":
                 send_cmd(ser, {"cmd": "disconnect"})
             elif cmd.startswith("disconnect "):
@@ -212,6 +396,14 @@ def interactive_mode(ser):
                 send_cmd(ser, {"cmd": "disconnect", "type": dev_type})
             elif cmd == "status":
                 send_cmd(ser, {"cmd": "status"})
+            elif cmd == "list":
+                list_devices(ser=ser)
+            elif cmd.startswith("list scan"):
+                secs = 8
+                parts = cmd.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    secs = int(parts[1])
+                list_devices(ser=ser, scan_seconds=secs)
             elif cmd == "keymap":
                 s = keymap_store.summary()
                 print(f"  local v{s['version']} remaps={s['remaps']} macros={s['macros']}")
@@ -281,18 +473,40 @@ def main():
     )
     parser.add_argument("--port", help="Serial port (e.g. COM3, /dev/ttyACM0)")
     parser.add_argument("--scan", action="store_true",
-                        help="Run one scan (10s) and exit")
+                        help="Run one scan (10s), print device table (name + MAC) and exit")
     parser.add_argument("--connect", metavar="TYPE ADDR", nargs=2,
                         help="Connect to BLE device (type: keyboard/mouse) and exit")
     parser.add_argument("--status", action="store_true",
                         help="Query status and exit")
     parser.add_argument("--list", action="store_true",
-                        help="List available serial ports")
+                        help="List serial ports + Bluetooth devices (name & MAC)")
+    parser.add_argument("--scan-list", action="store_true",
+                        help="Scan BLE HID devices, then list name/MAC table")
     args = parser.parse_args()
 
     if args.list:
+        # 1) 串口列表
+        print("Serial ports:")
         list_ports()
+        # 2) 蓝牙设备列表 (名称 + MAC): 连接中/已配对记录; 若接上设备则实时查询固件
+        port_path = find_port() if not args.port else args.port
+        ser = None
+        if port_path:
+            try:
+                ser = serial.Serial(port_path, BAUD, timeout=0.5)
+                t = threading.Thread(target=reader_thread, args=(ser,), daemon=True)
+                t.start()
+                time.sleep(0.8)
+            except serial.SerialException:
+                ser = None
+        print("\nBluetooth devices:")
+        list_devices(ser=ser)
+        if ser is not None:
+            ser.close()
         return
+
+    if args.scan_list:
+        pass  # 走下方正常流程, 在命令执行阶段做一次扫描并打印表格
 
     # 查找串口
     if args.port:
@@ -333,6 +547,10 @@ def main():
         time.sleep(10)
         send_cmd(ser, {"cmd": "scan_stop"})
         time.sleep(2)
+        # 扫描结束后打印设备表格: 名称 + MAC 地址
+        print_scan_table()
+    elif args.scan_list:
+        list_devices(ser=ser, scan_seconds=8)
     elif args.connect:
         dev_type, addr = args.connect
         print(f"Connecting to {dev_type} slot: {addr}...")
