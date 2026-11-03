@@ -11,7 +11,7 @@ ESP32-C3 BLE HID Bridge - PC Control Application
 用法:
   python app.py                          # 自动检测串口, 进入交互模式
   python app.py --port COM3              # 指定串口, 进入交互模式
-  python app.py --scan                   # 执行一次扫描 (10秒) 并退出
+  python app.py --scan                   # 执行一次扫描 (10秒), 结束后打印设备表格(名称+MAC)并退出
   python app.py --connect AA:BB:CC:DD:EE:FF  # 连接到指定设备并退出
   python app.py --status                 # 查询一次状态并退出
   python app.py --list                   # 列出所有可用串口
@@ -58,6 +58,9 @@ BAUD = 115200
 
 # 扫描结果缓存: addr -> {"name", "rssi", "appearance", "type"}
 scan_cache = {}
+
+# 已连接设备缓存: addr -> slot ("keyboard"/"mouse"), 由 connected/status 消息维护
+connected_cache = {}
 
 
 def find_port():
@@ -116,7 +119,6 @@ def list_devices(ser=None, scan_seconds=0):
       3. 可选一次 BLE 扫描 → 周围广播中的 HID 设备 (名称+MAC+RSSI)
     """
     known = _load_bindings()          # addr -> name
-    connected = {}                    # addr -> slot ("keyboard"/"mouse")
 
     def collect(msg):
         mtype = msg.get("type", "")
@@ -129,6 +131,15 @@ def list_devices(ser=None, scan_seconds=0):
                     "appearance": msg.get("appearance", 0),
                     "type": msg.get("device_type", 0),
                 }
+        elif mtype == "connected":
+            addr = msg.get("addr", "")
+            if addr:
+                slot = str(msg.get("device_type", "")).replace("connected_", "") or "unknown"
+                connected_cache[addr] = slot
+        elif mtype == "disconnected":
+            addr = msg.get("addr", "")
+            if addr:
+                connected_cache.pop(addr, None)
         elif mtype == "status":
             for slot_key in ("keyboard", "mouse"):
                 s = msg.get(slot_key) or {}
@@ -136,9 +147,13 @@ def list_devices(ser=None, scan_seconds=0):
                     addr = s.get("addr", "")
                     name = s.get("device", "")
                     if addr:
-                        connected[addr] = slot_key
-                        if name:
+                        connected_cache[addr] = slot_key
+                        if name and name != "(no name)":
                             known.setdefault(addr, name)
+                else:
+                    for a, sl in list(connected_cache.items()):
+                        if sl == slot_key:
+                            connected_cache.pop(a, None)
 
     global handle_msg
     if ser is not None:
@@ -170,9 +185,9 @@ def list_devices(ser=None, scan_seconds=0):
     for addr, name in known.items():
         if addr not in rows:
             rows[addr] = (name, "paired")
-    for addr in connected:
+    for addr, slot in connected_cache.items():
         name = rows.get(addr, ("", ""))[0] or known.get(addr, "")
-        rows[addr] = (name, f"CONNECTED [{connected[addr]}]")
+        rows[addr] = (name, f"CONNECTED [{slot}]")
 
     if not rows:
         print("  No Bluetooth devices known yet.")
@@ -201,6 +216,34 @@ keymap_store = None
 keymap_client = None
 
 
+def print_scan_table():
+    """打印扫描到的蓝牙设备表格: 名称 + MAC 地址 (+ RSSI / 状态)"""
+    known = _load_bindings()
+    rows = {}
+    for addr, info in scan_cache.items():
+        raw_name = (info.get("name") or "").strip()
+        name = raw_name or known.get(addr, "")
+        rows[addr] = (name, f"RSSI={info.get('rssi', 0)}dBm")
+    for addr, name in known.items():
+        if addr not in rows:
+            rows[addr] = (name, "paired")
+    for addr, slot in connected_cache.items():
+        name = rows.get(addr, ("", ""))[0] or known.get(addr, "")
+        rows[addr] = (name, f"CONNECTED [{slot}]")
+
+    if not rows:
+        print("\n  No BLE HID devices found during scan.")
+        return
+
+    print(f"\n  Scan results - Bluetooth devices (name / MAC address): {len(rows)} found")
+    print(f"  {'NAME':24s} {'MAC ADDRESS':18s} INFO")
+    print(f"  {'-' * 24} {'-' * 18} {'-' * 24}")
+    for addr, (name, extra) in sorted(rows.items(), key=lambda kv: kv[0]):
+        display = name if name else "(no name)"
+        print(f"  {display:24s} {addr:18s} {extra}")
+    print()
+
+
 def handle_msg(msg):
     """处理收到的 JSON 消息"""
     msg_type = msg.get("type", "")
@@ -210,13 +253,15 @@ def handle_msg(msg):
         return
 
     if msg_type == "scan_result":
-        name = msg.get("name", "Unknown")
+        name = msg.get("name", "") or ""
         addr = msg.get("addr", "")
         rssi = msg.get("rssi", 0)
+        # 无名设备用本地 known_devices 记录兜底显示真实名称
+        display_name = name.strip() or (_load_bindings().get(addr, "") or "(no name)")
         scan_cache[addr] = {"name": name, "rssi": rssi,
                             "appearance": msg.get("appearance", 0),
                             "type": msg.get("device_type", 0)}
-        print(f"  [HID] {name:20s} ({addr}) RSSI={rssi}dBm")
+        print(f"  [HID] {display_name:20s} ({addr}) RSSI={rssi}dBm")
 
     elif msg_type == "scan_complete":
         print("  [Scan complete]")
@@ -226,10 +271,16 @@ def handle_msg(msg):
         addr = msg.get("addr", "")
         dtype = msg.get("device_type", "unknown")
         _save_binding(addr, "" if device == "Unknown" else device)
+        slot = str(dtype).replace("connected_", "") or "unknown"
+        if addr:
+            connected_cache[addr] = slot
         print(f"  [Connected] {device} ({addr}) type={dtype}")
         print("  [Ready] BLE HID input is now forwarded to PC via USB.")
 
     elif msg_type == "disconnected":
+        addr = msg.get("addr", "")
+        if addr:
+            connected_cache.pop(addr, None)
         print("  [Disconnected]")
 
     elif msg_type == "status":
@@ -241,8 +292,14 @@ def handle_msg(msg):
                 name = s.get("device", "(no name)")
                 addr = s.get("addr", "")
                 _save_binding(addr, name if name != "(no name)" else "")
+                if addr:
+                    connected_cache[addr] = slot_key
                 print(f"    {slot_key:8s}: CONNECTED  {name} ({addr})")
             else:
+                # 清除该槽位残留的连接记录
+                for a, sl in list(connected_cache.items()):
+                    if sl == slot_key:
+                        connected_cache.pop(a, None)
                 print(f"    {slot_key:8s}: idle")
 
     elif msg_type == "keymap_state":
@@ -329,6 +386,9 @@ def interactive_mode(ser):
                 send_cmd(ser, {"cmd": "scan"})
             elif cmd == "stop":
                 send_cmd(ser, {"cmd": "scan_stop"})
+                time.sleep(0.5)
+                # 停止扫描后打印设备表格: 名称 + MAC 地址
+                print_scan_table()
             elif cmd == "disconnect":
                 send_cmd(ser, {"cmd": "disconnect"})
             elif cmd.startswith("disconnect "):
@@ -413,7 +473,7 @@ def main():
     )
     parser.add_argument("--port", help="Serial port (e.g. COM3, /dev/ttyACM0)")
     parser.add_argument("--scan", action="store_true",
-                        help="Run one scan (10s) and exit")
+                        help="Run one scan (10s), print device table (name + MAC) and exit")
     parser.add_argument("--connect", metavar="TYPE ADDR", nargs=2,
                         help="Connect to BLE device (type: keyboard/mouse) and exit")
     parser.add_argument("--status", action="store_true",
@@ -487,6 +547,8 @@ def main():
         time.sleep(10)
         send_cmd(ser, {"cmd": "scan_stop"})
         time.sleep(2)
+        # 扫描结束后打印设备表格: 名称 + MAC 地址
+        print_scan_table()
     elif args.scan_list:
         list_devices(ser=ser, scan_seconds=8)
     elif args.connect:
