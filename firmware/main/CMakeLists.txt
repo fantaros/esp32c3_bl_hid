@@ -3,7 +3,9 @@ idf_component_register(SRCS
     "usb_device.c"
     "hid_report.c"
     "ble_hid.c"
+    "ble_store.c"
     "cdc_ctrl.c"
+    "keymap.c"
     INCLUDE_DIRS "include"
-    REQUIRES usb nimble esp_timer esp_hw_support freertos cJSON
+    REQUIRES usb nimble esp_timer esp_hw_support freertos cJSON nvs_flash
 )

@@ -24,6 +24,7 @@
 #include "cdc_ctrl.h"
 #include "ble_hid.h"
 #include "usb_device.h"
+#include "keymap.h"
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -34,7 +35,7 @@
 static const char *TAG = "cdc_ctrl";
 
 /* ===== 缓冲区 ===== */
-static char s_buf[512];
+static char s_buf[2048];
 static size_t s_buf_len = 0;
 static bool s_dtr = false;
 
@@ -42,9 +43,26 @@ static bool s_dtr = false;
 
 static void cdc_send_and_free(cJSON *root)
 {
+    cdc_ctrl_send_json(root);
+}
+
+void cdc_ctrl_send_json(cJSON *root)
+{
+    if (!root) return;
     char *json = cJSON_PrintUnformatted(root);
     if (json) {
-        usb_cdc_send((const uint8_t *)json, strlen(json));
+        /* 以换行符结尾, 方便 PC 端按行分帧 */
+        size_t len = strlen(json);
+        char *framed = malloc(len + 2);
+        if (framed) {
+            memcpy(framed, json, len);
+            framed[len] = '\n';
+            framed[len + 1] = '\0';
+            usb_cdc_send((const uint8_t *)framed, (uint16_t)(len + 1));
+            free(framed);
+        } else {
+            usb_cdc_send((const uint8_t *)json, (uint16_t)len);
+        }
         free(json);
     }
     cJSON_Delete(root);
@@ -115,6 +133,26 @@ static void cdc_ctrl_handle_cmd(cJSON *root)
         cdc_ctrl_send_status(st.scanning,
                              st.keyboard_connected, st.keyboard_name, st.keyboard_addr,
                              st.mouse_connected, st.mouse_name, st.mouse_addr);
+    } else if (strcmp(command, "keymap_get") == 0) {
+        /* PC 拉取固件当前键位映射/宏配置 (含版本号), 用于双向同步 */
+        keymap_send_state();
+    } else if (strcmp(command, "keymap_set") == 0) {
+        /* PC 推送全量配置; version 冲突检测 + last-write-wins */
+        int n_remaps = 0, n_macros = 0, dropped = 0;
+        if (keymap_apply_set_json(root, &n_remaps, &n_macros, &dropped) != 0) {
+            cdc_ctrl_send_error(-1, "keymap version conflict (pull firmware state first)");
+            keymap_send_state();
+            return;
+        }
+        cJSON *ack = cJSON_CreateObject();
+        cJSON_AddStringToObject(ack, "type", "keymap_ack");
+        cJSON_AddNumberToObject(ack, "version", (double)keymap_get_version());
+        cJSON *applied = cJSON_CreateObject();
+        cJSON_AddNumberToObject(applied, "remaps", n_remaps);
+        cJSON_AddNumberToObject(applied, "macros", n_macros);
+        cJSON_AddItemToObject(ack, "applied", applied);
+        cJSON_AddNumberToObject(ack, "dropped", dropped);
+        cdc_ctrl_send_json(ack);
     }
 }
 
@@ -158,7 +196,7 @@ void cdc_ctrl_on_data(uint8_t *buf, uint32_t count)
         if (msg_end == 0) break;
 
         size_t msg_len = msg_end - offset;
-        char msg[256];
+        char msg[1920];
         if (msg_len >= sizeof(msg)) {
             offset = msg_end;
             continue;
